@@ -155,8 +155,8 @@ fn buildFullName(header: *const TarHeader, buf: *[512]u8) []const u8 {
 /// "<decimal len> <key>=<value>\n" records where len counts the whole record
 /// (digits, space, key=value and newline). `path` fills `pax_path` and
 /// `linkpath` fills `pax_link` (owned by the caller; previous values freed).
-/// Other keys are ignored. bsdtar emits these for paths > 100 bytes that no
-/// longer fit the ustar name field — the gcc bottle carries 47 of them (#403).
+/// Other keys are ignored. bsdtar emits these for paths that do not fit the
+/// ustar name/prefix fields.
 fn parsePaxRecords(alloc: std.mem.Allocator, data: []const u8, pax_path: *?[]u8, pax_link: *?[]u8) !void {
     var pos: usize = 0;
     while (pos < data.len) {
