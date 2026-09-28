@@ -6,6 +6,7 @@ All notable changes to nanobrew are documented here.
 
 ### Fixed
 - Honor pax extended `path`/`linkpath` headers in the native tar fallback so bottles with long paths + hardlinks (gcc 16.2.0) extract correctly. (#403)
+- Create the `/opt/nb` and `/opt/homebrew` symlinks during installation by running `nb init` from both installers, and print the absolute nb path in `sudo … init` hints so they work under sudo's secure_path. (#399)
 
 ## [0.1.212] - 2026-09-17
 
