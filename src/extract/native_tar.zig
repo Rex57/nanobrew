@@ -162,7 +162,7 @@ fn parsePaxRecords(alloc: std.mem.Allocator, data: []const u8, pax_path: *?[]u8,
     while (pos < data.len) {
         const sp = std.mem.indexOfScalarPos(u8, data, pos, ' ') orelse return error.MalformedPaxHeader;
         const len = std.fmt.parseUnsigned(usize, data[pos..sp], 10) catch return error.MalformedPaxHeader;
-        if (len < 2 or pos + len > data.len) return error.MalformedPaxHeader;
+        if (len < 2 or len > data.len - pos) return error.MalformedPaxHeader;
         if (data[pos + len - 1] != '\n') return error.MalformedPaxHeader;
         const record = data[sp + 1 .. pos + len - 1];
         const eq = std.mem.indexOfScalar(u8, record, '=') orelse return error.MalformedPaxHeader;
@@ -997,6 +997,7 @@ test "parsePaxRecords reads path and linkpath, rejects malformed records" {
     try testing.expectError(error.MalformedPaxHeader, parsePaxRecords(alloc, "5 x", &pax_path, &pax_link));
     try testing.expectError(error.MalformedPaxHeader, parsePaxRecords(alloc, "9 noeq\n", &pax_path, &pax_link));
     try testing.expectError(error.MalformedPaxHeader, parsePaxRecords(alloc, "99 path=x\n", &pax_path, &pax_link));
+    try testing.expectError(error.MalformedPaxHeader, parsePaxRecords(alloc, "6 x=\n\n18446744073709551615 path=x\n", &pax_path, &pax_link));
 }
 
 const pax_long_1 = "dir/" ++ "a" ** 100 ++ "-enums.def";
