@@ -151,6 +151,34 @@ fn buildFullName(header: *const TarHeader, buf: *[512]u8) []const u8 {
     return name;
 }
 
+/// Parse a pax extended-header data block: repeated
+/// "<decimal len> <key>=<value>\n" records where len counts the whole record
+/// (digits, space, key=value and newline). `path` fills `pax_path` and
+/// `linkpath` fills `pax_link` (owned by the caller; previous values freed).
+/// Other keys are ignored. bsdtar emits these for paths > 100 bytes that no
+/// longer fit the ustar name field — the gcc bottle carries 47 of them (#403).
+fn parsePaxRecords(alloc: std.mem.Allocator, data: []const u8, pax_path: *?[]u8, pax_link: *?[]u8) !void {
+    var pos: usize = 0;
+    while (pos < data.len) {
+        const sp = std.mem.indexOfScalarPos(u8, data, pos, ' ') orelse return error.MalformedPaxHeader;
+        const len = std.fmt.parseUnsigned(usize, data[pos..sp], 10) catch return error.MalformedPaxHeader;
+        if (len < 2 or pos + len > data.len) return error.MalformedPaxHeader;
+        if (data[pos + len - 1] != '\n') return error.MalformedPaxHeader;
+        const record = data[sp + 1 .. pos + len - 1];
+        const eq = std.mem.indexOfScalar(u8, record, '=') orelse return error.MalformedPaxHeader;
+        const key = record[0..eq];
+        const value = record[eq + 1 ..];
+        if (std.mem.eql(u8, key, "path")) {
+            if (pax_path.*) |old| alloc.free(old);
+            pax_path.* = try alloc.dupe(u8, value);
+        } else if (std.mem.eql(u8, key, "linkpath")) {
+            if (pax_link.*) |old| alloc.free(old);
+            pax_link.* = try alloc.dupe(u8, value);
+        }
+        pos += len;
+    }
+}
+
 /// Result of listing tar contents.
 pub const TarListResult = struct {
     files: [][]const u8,
@@ -170,7 +198,11 @@ pub fn listFiles(alloc: std.mem.Allocator, tar_data: []const u8) !TarListResult 
     var rejected: usize = 0;
     var pos: usize = 0;
     var gnu_long_name: ?[]const u8 = null;
+    var pax_path: ?[]u8 = null;
+    var pax_link: ?[]u8 = null;
     defer if (gnu_long_name) |n| alloc.free(n);
+    defer if (pax_path) |n| alloc.free(n);
+    defer if (pax_link) |n| alloc.free(n);
 
     while (pos + BLOCK_SIZE <= tar_data.len) {
         const block: *const [BLOCK_SIZE]u8 = @ptrCast(tar_data[pos..][0..BLOCK_SIZE]);
@@ -196,8 +228,17 @@ pub fn listFiles(alloc: std.mem.Allocator, tar_data: []const u8) !TarListResult 
             continue;
         }
 
-        // Skip pax headers and GNU long link names
-        if (typeflag == TypeFlag.pax_global or typeflag == TypeFlag.pax_extended or typeflag == TypeFlag.gnu_long_link) {
+        // pax extended headers carry the next entry's real path/linkpath
+        if (typeflag == TypeFlag.pax_extended) {
+            pos += BLOCK_SIZE;
+            if (pos + file_size > tar_data.len) return error.TruncatedArchive;
+            try parsePaxRecords(alloc, tar_data[pos .. pos + file_size], &pax_path, &pax_link);
+            pos += alignToBlock(file_size);
+            continue;
+        }
+
+        // Skip pax global headers and GNU long link names
+        if (typeflag == TypeFlag.pax_global or typeflag == TypeFlag.gnu_long_link) {
             pos += BLOCK_SIZE;
             pos += alignToBlock(file_size);
             if (gnu_long_name) |old| {
@@ -207,29 +248,43 @@ pub fn listFiles(alloc: std.mem.Allocator, tar_data: []const u8) !TarListResult 
             continue;
         }
 
-        // Resolve entry name
+        // Resolve entry name: pax path > GNU long name > ustar prefix+name
         var name_buf: [512]u8 = undefined;
-        const raw_name = if (gnu_long_name) |ln| ln else buildFullName(header, &name_buf);
+        const raw_name = if (pax_path) |pp| pp else if (gnu_long_name) |ln| ln else buildFullName(header, &name_buf);
         const entry_name = normalizePath(raw_name);
-
-        // Consume the long name
-        if (gnu_long_name) |old| {
-            alloc.free(old);
-            gnu_long_name = null;
-        }
 
         pos += BLOCK_SIZE;
 
-        // Only collect regular files and symlinks/hardlinks (skip dirs)
-        switch (typeflag) {
-            TypeFlag.regular, TypeFlag.regular_alt, TypeFlag.symlink, TypeFlag.hardlink => {
-                if (isPathSafe(entry_name)) {
-                    try files.append(alloc, try alloc.dupe(u8, entry_name));
-                } else {
-                    rejected += 1;
+        // Consume long names / pax records once the entry is handled —
+        // entry_name may slice into them (testing.allocator poisons freed
+        // memory, so freeing before use corrupts the path).
+        {
+            defer {
+                if (gnu_long_name) |old| {
+                    alloc.free(old);
+                    gnu_long_name = null;
                 }
-            },
-            else => {},
+                if (pax_path) |old| {
+                    alloc.free(old);
+                    pax_path = null;
+                }
+                if (pax_link) |old| {
+                    alloc.free(old);
+                    pax_link = null;
+                }
+            }
+
+            // Only collect regular files and symlinks/hardlinks (skip dirs)
+            switch (typeflag) {
+                TypeFlag.regular, TypeFlag.regular_alt, TypeFlag.symlink, TypeFlag.hardlink => {
+                    if (isPathSafe(entry_name)) {
+                        try files.append(alloc, try alloc.dupe(u8, entry_name));
+                    } else {
+                        rejected += 1;
+                    }
+                },
+                else => {},
+            }
         }
 
         // Advance past file data blocks
@@ -264,8 +319,12 @@ pub fn extractToDir(alloc: std.mem.Allocator, io: std.Io, tar_data: []const u8, 
     var pos: usize = 0;
     var gnu_long_name: ?[]const u8 = null;
     var gnu_long_link: ?[]const u8 = null;
+    var pax_path: ?[]u8 = null;
+    var pax_link: ?[]u8 = null;
     defer if (gnu_long_name) |n| alloc.free(n);
     defer if (gnu_long_link) |n| alloc.free(n);
+    defer if (pax_path) |n| alloc.free(n);
+    defer if (pax_link) |n| alloc.free(n);
 
     while (pos + BLOCK_SIZE <= tar_data.len) {
         const block: *const [BLOCK_SIZE]u8 = @ptrCast(tar_data[pos..][0..BLOCK_SIZE]);
@@ -301,8 +360,17 @@ pub fn extractToDir(alloc: std.mem.Allocator, io: std.Io, tar_data: []const u8, 
             continue;
         }
 
-        // Skip pax headers
-        if (typeflag == TypeFlag.pax_global or typeflag == TypeFlag.pax_extended) {
+        // pax extended headers carry the next entry's real path/linkpath
+        if (typeflag == TypeFlag.pax_extended) {
+            pos += BLOCK_SIZE;
+            if (pos + file_size > tar_data.len) return error.TruncatedArchive;
+            try parsePaxRecords(alloc, tar_data[pos .. pos + file_size], &pax_path, &pax_link);
+            pos += alignToBlock(file_size);
+            continue;
+        }
+
+        // Skip pax global headers (they apply to no single entry)
+        if (typeflag == TypeFlag.pax_global) {
             pos += BLOCK_SIZE;
             pos += alignToBlock(file_size);
             if (gnu_long_name) |old| {
@@ -316,113 +384,123 @@ pub fn extractToDir(alloc: std.mem.Allocator, io: std.Io, tar_data: []const u8, 
             continue;
         }
 
-        // Resolve entry name and link target
+        // Resolve entry name and link target: pax records > GNU long > ustar
         var name_buf: [512]u8 = undefined;
-        const raw_name = if (gnu_long_name) |ln| ln else buildFullName(header, &name_buf);
+        const raw_name = if (pax_path) |pp| pp else if (gnu_long_name) |ln| ln else buildFullName(header, &name_buf);
         const entry_name = normalizePath(raw_name);
-        const link_target = if (gnu_long_link) |ll| ll else fieldStr(&header.linkname);
-
-        // Consume long name/link
-        if (gnu_long_name) |old| {
-            alloc.free(old);
-            gnu_long_name = null;
-        }
-        if (gnu_long_link) |old| {
-            alloc.free(old);
-            gnu_long_link = null;
-        }
+        const link_target = if (pax_link) |pl| pl else if (gnu_long_link) |ll| ll else fieldStr(&header.linkname);
 
         pos += BLOCK_SIZE;
 
-        // Path safety check
-        if (!isPathSafe(entry_name)) {
-            rejected += 1;
-            pos += alignToBlock(file_size);
-            continue;
-        }
-
-        // Build absolute destination path
-        var path_buf: [4096]u8 = undefined;
-        const abs_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dest_dir, entry_name }) catch {
-            pos += alignToBlock(file_size);
-            continue;
-        };
-
-        switch (typeflag) {
-            TypeFlag.directory => {
-                try makeDirRecursive(lib_io, abs_path);
-            },
-            TypeFlag.regular, TypeFlag.regular_alt => {
-                // Ensure parent directory exists
-                if (std.fs.path.dirname(abs_path)) |parent| {
-                    try makeDirRecursive(lib_io, parent);
+        // Consume long names/links / pax records once the entry is handled —
+        // entry_name/link_target may slice into them.
+        entry: {
+            defer {
+                if (gnu_long_name) |old| {
+                    alloc.free(old);
+                    gnu_long_name = null;
                 }
-
-                const data_end = pos + file_size;
-                if (data_end > tar_data.len) return error.TruncatedArchive;
-
-                // Extract file mode from header
-                const mode_val = parseOctal(&header.mode);
-                const mode: std.posix.mode_t = @intCast(mode_val & 0o0777);
-
-                try writeFile(lib_io, abs_path, tar_data[pos..data_end], mode);
-
-                try files.append(alloc, try alloc.dupe(u8, entry_name));
-            },
-            TypeFlag.symlink => {
-                if (!isLinkTargetSafe(entry_name, link_target, dest_dir)) {
-                    continue; // skip unsafe symlink
+                if (gnu_long_link) |old| {
+                    alloc.free(old);
+                    gnu_long_link = null;
                 }
-
-                if (std.fs.path.dirname(abs_path)) |parent| {
-                    try makeDirRecursive(lib_io, parent);
+                if (pax_path) |old| {
+                    alloc.free(old);
+                    pax_path = null;
                 }
-
-                // Remove existing file/symlink before creating
-                std.Io.Dir.deleteFileAbsolute(lib_io, abs_path) catch {};
-
-                // Null-terminate both strings for the C symlink call
-                path_buf[abs_path.len] = 0;
-                const abs_path_z: [*:0]const u8 = @ptrCast(abs_path.ptr);
-                var lt_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-                const lt_len = @min(link_target.len, std.fs.max_path_bytes);
-                @memcpy(lt_buf[0..lt_len], link_target[0..lt_len]);
-                lt_buf[lt_len] = 0;
-                const link_target_z: [*:0]const u8 = @ptrCast(&lt_buf);
-                if (std.c.symlink(link_target_z, abs_path_z) != 0) {
-                    return error.LinkFailed;
+                if (pax_link) |old| {
+                    alloc.free(old);
+                    pax_link = null;
                 }
-                try files.append(alloc, try alloc.dupe(u8, entry_name));
-            },
-            TypeFlag.hardlink => {
-                if (std.fs.path.dirname(abs_path)) |parent| {
-                    try makeDirRecursive(lib_io, parent);
-                }
+            }
 
-                // Resolve the link target relative to dest_dir
-                const normalized_target = normalizePath(link_target);
-                if (!isPathSafe(normalized_target)) {
-                    continue; // skip unsafe hardlink
-                }
-                var target_buf: [4096]u8 = undefined;
-                const abs_target = std.fmt.bufPrint(&target_buf, "{s}/{s}", .{ dest_dir, normalized_target }) catch {
-                    pos += alignToBlock(file_size);
-                    continue;
-                };
+            // Path safety check
+            if (!isPathSafe(entry_name)) {
+                rejected += 1;
+                break :entry;
+            }
 
-                std.Io.Dir.deleteFileAbsolute(lib_io, abs_path) catch {};
-                target_buf[abs_target.len] = 0;
-                path_buf[abs_path.len] = 0;
-                const abs_target_z: [*:0]const u8 = @ptrCast(abs_target.ptr);
-                const abs_path_z2: [*:0]const u8 = @ptrCast(abs_path.ptr);
-                if (std.c.link(abs_target_z, abs_path_z2) != 0) {
-                    return error.LinkFailed;
-                }
-                try files.append(alloc, try alloc.dupe(u8, entry_name));
-            },
-            else => {
-                // Unknown type flag — skip
-            },
+            // Build absolute destination path
+            var path_buf: [4096]u8 = undefined;
+            const abs_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dest_dir, entry_name }) catch {
+                break :entry;
+            };
+
+            switch (typeflag) {
+                TypeFlag.directory => {
+                    try makeDirRecursive(lib_io, abs_path);
+                },
+                TypeFlag.regular, TypeFlag.regular_alt => {
+                    // Ensure parent directory exists
+                    if (std.fs.path.dirname(abs_path)) |parent| {
+                        try makeDirRecursive(lib_io, parent);
+                    }
+
+                    const data_end = pos + file_size;
+                    if (data_end > tar_data.len) return error.TruncatedArchive;
+
+                    // Extract file mode from header
+                    const mode_val = parseOctal(&header.mode);
+                    const mode: std.posix.mode_t = @intCast(mode_val & 0o0777);
+
+                    try writeFile(lib_io, abs_path, tar_data[pos..data_end], mode);
+
+                    try files.append(alloc, try alloc.dupe(u8, entry_name));
+                },
+                TypeFlag.symlink => {
+                    if (!isLinkTargetSafe(entry_name, link_target, dest_dir)) {
+                        break :entry; // skip unsafe symlink
+                    }
+
+                    if (std.fs.path.dirname(abs_path)) |parent| {
+                        try makeDirRecursive(lib_io, parent);
+                    }
+
+                    // Remove existing file/symlink before creating
+                    std.Io.Dir.deleteFileAbsolute(lib_io, abs_path) catch {};
+
+                    // Null-terminate both strings for the C symlink call
+                    path_buf[abs_path.len] = 0;
+                    const abs_path_z: [*:0]const u8 = @ptrCast(abs_path.ptr);
+                    var lt_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+                    const lt_len = @min(link_target.len, std.fs.max_path_bytes);
+                    @memcpy(lt_buf[0..lt_len], link_target[0..lt_len]);
+                    lt_buf[lt_len] = 0;
+                    const link_target_z: [*:0]const u8 = @ptrCast(&lt_buf);
+                    if (std.c.symlink(link_target_z, abs_path_z) != 0) {
+                        return error.LinkFailed;
+                    }
+                    try files.append(alloc, try alloc.dupe(u8, entry_name));
+                },
+                TypeFlag.hardlink => {
+                    if (std.fs.path.dirname(abs_path)) |parent| {
+                        try makeDirRecursive(lib_io, parent);
+                    }
+
+                    // Resolve the link target relative to dest_dir
+                    const normalized_target = normalizePath(link_target);
+                    if (!isPathSafe(normalized_target)) {
+                        break :entry; // skip unsafe hardlink
+                    }
+                    var target_buf: [4096]u8 = undefined;
+                    const abs_target = std.fmt.bufPrint(&target_buf, "{s}/{s}", .{ dest_dir, normalized_target }) catch {
+                        break :entry;
+                    };
+
+                    std.Io.Dir.deleteFileAbsolute(lib_io, abs_path) catch {};
+                    target_buf[abs_target.len] = 0;
+                    path_buf[abs_path.len] = 0;
+                    const abs_target_z: [*:0]const u8 = @ptrCast(abs_target.ptr);
+                    const abs_path_z2: [*:0]const u8 = @ptrCast(abs_path.ptr);
+                    if (std.c.link(abs_target_z, abs_path_z2) != 0) {
+                        return error.LinkFailed;
+                    }
+                    try files.append(alloc, try alloc.dupe(u8, entry_name));
+                },
+                else => {
+                    // Unknown type flag — skip
+                },
+            }
         }
 
         pos += alignToBlock(file_size);
@@ -453,8 +531,12 @@ pub fn extractFromReader(alloc: std.mem.Allocator, io: std.Io, reader: *std.Io.R
     var rejected: usize = 0;
     var gnu_long_name: ?[]const u8 = null;
     var gnu_long_link: ?[]const u8 = null;
+    var pax_path: ?[]u8 = null;
+    var pax_link: ?[]u8 = null;
     defer if (gnu_long_name) |n| alloc.free(n);
     defer if (gnu_long_link) |n| alloc.free(n);
+    defer if (pax_path) |n| alloc.free(n);
+    defer if (pax_link) |n| alloc.free(n);
 
     var block: [BLOCK_SIZE]u8 = undefined;
     while (true) {
@@ -497,8 +579,20 @@ pub fn extractFromReader(alloc: std.mem.Allocator, io: std.Io, reader: *std.Io.R
             continue;
         }
 
-        // Skip pax headers
-        if (typeflag == TypeFlag.pax_global or typeflag == TypeFlag.pax_extended) {
+        // pax extended headers carry the next entry's real path/linkpath
+        if (typeflag == TypeFlag.pax_extended) {
+            if (file_size > 1 << 20) return error.CorruptArchive;
+            const fsz: usize = @intCast(file_size);
+            const raw = try alloc.alloc(u8, fsz);
+            defer alloc.free(raw);
+            try reader.readSliceAll(raw);
+            try reader.discardAll64(payload_padded - file_size);
+            try parsePaxRecords(alloc, raw, &pax_path, &pax_link);
+            continue;
+        }
+
+        // Skip pax global headers (they apply to no single entry)
+        if (typeflag == TypeFlag.pax_global) {
             try reader.discardAll64(payload_padded);
             if (gnu_long_name) |old| {
                 alloc.free(old);
@@ -511,104 +605,116 @@ pub fn extractFromReader(alloc: std.mem.Allocator, io: std.Io, reader: *std.Io.R
             continue;
         }
 
-        // Resolve entry name and link target
+        // Resolve entry name and link target: pax records > GNU long > ustar
         var name_buf: [512]u8 = undefined;
-        const raw_name = if (gnu_long_name) |ln| ln else buildFullName(header, &name_buf);
+        const raw_name = if (pax_path) |pp| pp else if (gnu_long_name) |ln| ln else buildFullName(header, &name_buf);
         const entry_name = normalizePath(raw_name);
-        const link_target = if (gnu_long_link) |ll| ll else fieldStr(&header.linkname);
-
-        if (gnu_long_name) |old| {
-            alloc.free(old);
-            gnu_long_name = null;
-        }
-        if (gnu_long_link) |old| {
-            alloc.free(old);
-            gnu_long_link = null;
-        }
+        const link_target = if (pax_link) |pl| pl else if (gnu_long_link) |ll| ll else fieldStr(&header.linkname);
 
         // Bytes the stream still has to skip past after this entry's
         // handler runs. Regular files consume their payload by streaming;
         // everything else leaves the full padded payload to discard.
         var payload_remaining: u64 = payload_padded;
 
-        // Path safety check
-        if (!isPathSafe(entry_name)) {
-            rejected += 1;
-            try reader.discardAll64(payload_remaining);
-            continue;
-        }
-
-        // Build absolute destination path
-        var path_buf: [4096]u8 = undefined;
-        const abs_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dest_dir, entry_name }) catch {
-            try reader.discardAll64(payload_remaining);
-            continue;
-        };
-
-        switch (typeflag) {
-            TypeFlag.directory => {
-                makeDirRecursive(lib_io, abs_path) catch {};
-            },
-            TypeFlag.regular, TypeFlag.regular_alt => {
-                // Ensure parent directory exists
-                if (std.fs.path.dirname(abs_path)) |parent| {
-                    makeDirRecursive(lib_io, parent) catch {};
+        // Consume long names/links / pax records once the entry is handled —
+        // entry_name/link_target may slice into them.
+        entry: {
+            defer {
+                if (gnu_long_name) |old| {
+                    alloc.free(old);
+                    gnu_long_name = null;
                 }
+                if (gnu_long_link) |old| {
+                    alloc.free(old);
+                    gnu_long_link = null;
+                }
+                if (pax_path) |old| {
+                    alloc.free(old);
+                    pax_path = null;
+                }
+                if (pax_link) |old| {
+                    alloc.free(old);
+                    pax_link = null;
+                }
+            }
 
-                // Extract file mode from header
-                const mode_val = parseOctal(&header.mode);
-                const mode: std.posix.mode_t = @intCast(mode_val & 0o0777);
+            // Path safety check
+            if (!isPathSafe(entry_name)) {
+                rejected += 1;
+                break :entry;
+            }
 
-                // Stream the payload straight to disk. A create failure
-                // (permissions, etc.) leaves the stream untouched at the
-                // payload start so we can skip the entry exactly like
-                // extractToDir does; a mid-stream failure is fatal — the
-                // archive and filesystem are out of sync either way.
-                const wrote = try writeFileStreaming(lib_io, abs_path, reader, file_size, mode);
-                payload_remaining = if (wrote) payload_padded - file_size else payload_padded;
-            },
-            TypeFlag.symlink => {
-                if (isLinkTargetSafe(entry_name, link_target, dest_dir)) {
+            // Build absolute destination path
+            var path_buf: [4096]u8 = undefined;
+            const abs_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dest_dir, entry_name }) catch {
+                break :entry;
+            };
+
+            switch (typeflag) {
+                TypeFlag.directory => {
+                    makeDirRecursive(lib_io, abs_path) catch {};
+                },
+                TypeFlag.regular, TypeFlag.regular_alt => {
+                    // Ensure parent directory exists
                     if (std.fs.path.dirname(abs_path)) |parent| {
                         makeDirRecursive(lib_io, parent) catch {};
                     }
 
-                    // Remove existing file/symlink before creating
-                    std.Io.Dir.deleteFileAbsolute(lib_io, abs_path) catch {};
+                    // Extract file mode from header
+                    const mode_val = parseOctal(&header.mode);
+                    const mode: std.posix.mode_t = @intCast(mode_val & 0o0777);
 
-                    // Null-terminate both strings for the C symlink call
-                    path_buf[abs_path.len] = 0;
-                    const abs_path_z: [*:0]const u8 = @ptrCast(abs_path.ptr);
-                    var lt_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-                    const lt_len = @min(link_target.len, std.fs.max_path_bytes);
-                    @memcpy(lt_buf[0..lt_len], link_target[0..lt_len]);
-                    lt_buf[lt_len] = 0;
-                    const link_target_z: [*:0]const u8 = @ptrCast(&lt_buf);
-                    _ = std.c.symlink(link_target_z, abs_path_z);
-                }
-            },
-            TypeFlag.hardlink => {
-                if (std.fs.path.dirname(abs_path)) |parent| {
-                    makeDirRecursive(lib_io, parent) catch {};
-                }
+                    // Stream the payload straight to disk. A create failure
+                    // (permissions, etc.) leaves the stream untouched at the
+                    // payload start so we can skip the entry exactly like
+                    // extractToDir does; a mid-stream failure is fatal — the
+                    // archive and filesystem are out of sync either way.
+                    const wrote = try writeFileStreaming(lib_io, abs_path, reader, file_size, mode);
+                    payload_remaining = if (wrote) payload_padded - file_size else payload_padded;
+                },
+                TypeFlag.symlink => {
+                    if (isLinkTargetSafe(entry_name, link_target, dest_dir)) {
+                        if (std.fs.path.dirname(abs_path)) |parent| {
+                            makeDirRecursive(lib_io, parent) catch {};
+                        }
 
-                // Resolve the link target relative to dest_dir
-                const normalized_target = normalizePath(link_target);
-                if (isPathSafe(normalized_target)) {
-                    var target_buf: [4096]u8 = undefined;
-                    if (std.fmt.bufPrint(&target_buf, "{s}/{s}", .{ dest_dir, normalized_target })) |abs_target| {
+                        // Remove existing file/symlink before creating
                         std.Io.Dir.deleteFileAbsolute(lib_io, abs_path) catch {};
-                        target_buf[abs_target.len] = 0;
+
+                        // Null-terminate both strings for the C symlink call
                         path_buf[abs_path.len] = 0;
-                        const abs_target_z: [*:0]const u8 = @ptrCast(abs_target.ptr);
-                        const abs_path_z2: [*:0]const u8 = @ptrCast(abs_path.ptr);
-                        _ = std.c.link(abs_target_z, abs_path_z2);
-                    } else |_| {}
-                }
-            },
-            else => {
-                // Unknown type flag — skip
-            },
+                        const abs_path_z: [*:0]const u8 = @ptrCast(abs_path.ptr);
+                        var lt_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+                        const lt_len = @min(link_target.len, std.fs.max_path_bytes);
+                        @memcpy(lt_buf[0..lt_len], link_target[0..lt_len]);
+                        lt_buf[lt_len] = 0;
+                        const link_target_z: [*:0]const u8 = @ptrCast(&lt_buf);
+                        _ = std.c.symlink(link_target_z, abs_path_z);
+                    }
+                },
+                TypeFlag.hardlink => {
+                    if (std.fs.path.dirname(abs_path)) |parent| {
+                        makeDirRecursive(lib_io, parent) catch {};
+                    }
+
+                    // Resolve the link target relative to dest_dir
+                    const normalized_target = normalizePath(link_target);
+                    if (isPathSafe(normalized_target)) {
+                        var target_buf: [4096]u8 = undefined;
+                        if (std.fmt.bufPrint(&target_buf, "{s}/{s}", .{ dest_dir, normalized_target })) |abs_target| {
+                            std.Io.Dir.deleteFileAbsolute(lib_io, abs_path) catch {};
+                            target_buf[abs_target.len] = 0;
+                            path_buf[abs_path.len] = 0;
+                            const abs_target_z: [*:0]const u8 = @ptrCast(abs_target.ptr);
+                            const abs_path_z2: [*:0]const u8 = @ptrCast(abs_path.ptr);
+                            _ = std.c.link(abs_target_z, abs_path_z2);
+                        } else |_| {}
+                    }
+                },
+                else => {
+                    // Unknown type flag — skip
+                },
+            }
         }
 
         if (payload_remaining > 0) try reader.discardAll64(payload_remaining);
@@ -857,4 +963,163 @@ test "extractToDir propagates payload write failures (#367)" {
         for (files) |f| testing.allocator.free(f);
         return error.TestExpectedError;
     } else |_| {}
+}
+
+// Helper — write a pax "<len> <key>=<value>\n" record into buf, returning its
+// length. len counts the whole record including the decimal digits.
+fn writePaxRecord(buf: []u8, key: []const u8, value: []const u8) usize {
+    var len = key.len + value.len + 3; // ' ', '=' and '\n'; digits added below
+    while (true) {
+        const total = key.len + value.len + 3 + std.fmt.count("{d}", .{len});
+        if (total == len) break;
+        len = total;
+    }
+    return (std.fmt.bufPrint(buf, "{d} {s}={s}\n", .{ len, key, value }) catch unreachable).len;
+}
+
+test "parsePaxRecords reads path and linkpath, rejects malformed records" {
+    const alloc = testing.allocator;
+    var buf: [256]u8 = undefined;
+    const n = writePaxRecord(&buf, "path", "dir/some/file");
+    var pax_path: ?[]u8 = null;
+    var pax_link: ?[]u8 = null;
+    defer if (pax_path) |p| alloc.free(p);
+    defer if (pax_link) |p| alloc.free(p);
+    try parsePaxRecords(alloc, buf[0..n], &pax_path, &pax_link);
+    try testing.expectEqualStrings("dir/some/file", pax_path.?);
+    try testing.expect(pax_link == null);
+
+    const n2 = writePaxRecord(buf[n..], "linkpath", "other/target");
+    try parsePaxRecords(alloc, buf[n .. n + n2], &pax_path, &pax_link);
+    try testing.expectEqualStrings("other/target", pax_link.?);
+
+    try testing.expectError(error.MalformedPaxHeader, parsePaxRecords(alloc, "abc", &pax_path, &pax_link));
+    try testing.expectError(error.MalformedPaxHeader, parsePaxRecords(alloc, "5 x", &pax_path, &pax_link));
+    try testing.expectError(error.MalformedPaxHeader, parsePaxRecords(alloc, "9 noeq\n", &pax_path, &pax_link));
+    try testing.expectError(error.MalformedPaxHeader, parsePaxRecords(alloc, "99 path=x\n", &pax_path, &pax_link));
+}
+
+const pax_long_1 = "dir/" ++ "a" ** 100 ++ "-enums.def";
+const pax_long_2 = "dir/" ++ "a" ** 100 ++ "-flags.def";
+
+// Append a pax 'x' header + record data + following entry header + payload to
+// tar_data at `pos`, returning the next free offset. The entry gets `name`'s
+// first 100 bytes in its ustar name field like bsdtar's truncation.
+fn appendPaxEntry(tar_data: []u8, pos: usize, pax_buf: []u8, pax_path: []const u8, mode: []const u8, typeflag: u8, linkname: []const u8, payload: []const u8) usize {
+    const rec_len = writePaxRecord(pax_buf, "path", pax_path);
+    writeHeader(tar_data[pos..][0..BLOCK_SIZE], "PaxHeader", "0000644", rec_len, TypeFlag.pax_extended, "");
+    @memcpy(tar_data[pos + BLOCK_SIZE ..][0..rec_len], pax_buf[0..rec_len]);
+    var next = pos + BLOCK_SIZE + alignToBlock(rec_len);
+    writeHeader(tar_data[next..][0..BLOCK_SIZE], pax_path[0..100], mode, payload.len, typeflag, linkname);
+    @memcpy(tar_data[next + BLOCK_SIZE ..][0..payload.len], payload);
+    next += BLOCK_SIZE + alignToBlock(payload.len);
+    return next;
+}
+
+test "extractToDir - pax path header overrides truncated ustar name (issue #403)" {
+    const alloc = testing.allocator;
+    var pax_buf: [256]u8 = undefined;
+    var tar_data: [BLOCK_SIZE * 10]u8 = @splat(0);
+    // Two entries whose ustar names truncate to the SAME 100 bytes — the gcc
+    // bottle's aarch64-tuning-* collision that produced AccessDenied (#403).
+    const next = appendPaxEntry(&tar_data, 0, &pax_buf, pax_long_1, "0000644", TypeFlag.regular, "", "ENUMS");
+    _ = appendPaxEntry(&tar_data, next, &pax_buf, pax_long_2, "0000444", TypeFlag.regular, "", "FLAGS");
+
+    var tmp_buf: [128]u8 = undefined;
+    const tmp_dir = std.fmt.bufPrint(&tmp_buf, "/tmp/nb-test-pax-{d}", .{std.c.getpid()}) catch unreachable;
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.createDirAbsolute(lib_io, tmp_dir, .default_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(lib_io, tmp_dir) catch {};
+
+    const files = try extractToDir(alloc, lib_io, &tar_data, tmp_dir);
+    defer {
+        for (files) |f| alloc.free(f);
+        alloc.free(files);
+    }
+    try testing.expectEqual(@as(usize, 2), files.len);
+
+    var path_buf: [4096]u8 = undefined;
+    var contents: [16]u8 = undefined;
+    for ([_][]const u8{ pax_long_1, pax_long_2 }, [_][]const u8{ "ENUMS", "FLAGS" }) |rel, expected| {
+        const abs = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ tmp_dir, rel }) catch unreachable;
+        const f = try std.Io.Dir.openFileAbsolute(lib_io, abs, .{});
+        defer f.close(lib_io);
+        const n = try f.readPositionalAll(lib_io, &contents, 0);
+        try testing.expectEqualStrings(expected, contents[0..n]);
+    }
+
+    // The shared 100-byte truncated name must not appear.
+    const truncated = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ tmp_dir, pax_long_1[0..100] }) catch unreachable;
+    if (std.Io.Dir.accessAbsolute(lib_io, truncated, .{})) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "listFiles honors pax path" {
+    const alloc = testing.allocator;
+    var pax_buf: [256]u8 = undefined;
+    var tar_data: [BLOCK_SIZE * 5]u8 = @splat(0);
+    _ = appendPaxEntry(&tar_data, 0, &pax_buf, pax_long_1, "0000644", TypeFlag.regular, "", "X");
+
+    const result = try listFiles(alloc, &tar_data);
+    defer {
+        for (result.files) |f| alloc.free(f);
+        alloc.free(result.files);
+    }
+    try testing.expectEqual(@as(usize, 1), result.files.len);
+    try testing.expectEqualStrings(pax_long_1, result.files[0]);
+}
+
+test "extractFromReader honors pax path" {
+    const alloc = testing.allocator;
+    var pax_buf: [256]u8 = undefined;
+    var tar_data: [BLOCK_SIZE * 5]u8 = @splat(0);
+    _ = appendPaxEntry(&tar_data, 0, &pax_buf, pax_long_1, "0000644", TypeFlag.regular, "", "ENUMS");
+
+    var tmp_buf: [128]u8 = undefined;
+    const tmp_dir = std.fmt.bufPrint(&tmp_buf, "/tmp/nb-test-pax-rdr-{d}", .{std.c.getpid()}) catch unreachable;
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.createDirAbsolute(lib_io, tmp_dir, .default_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(lib_io, tmp_dir) catch {};
+
+    var reader = std.Io.Reader.fixed(&tar_data);
+    try extractFromReader(alloc, lib_io, &reader, tmp_dir);
+
+    var path_buf: [4096]u8 = undefined;
+    const abs = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ tmp_dir, pax_long_1 }) catch unreachable;
+    const f = try std.Io.Dir.openFileAbsolute(lib_io, abs, .{});
+    defer f.close(lib_io);
+}
+
+test "extractToDir - pax linkpath overrides header linkname for symlink" {
+    const alloc = testing.allocator;
+    var pax_buf: [256]u8 = undefined;
+    var tar_data: [BLOCK_SIZE * 8]u8 = @splat(0);
+    writeHeader(tar_data[0..BLOCK_SIZE], "lib/real.so", "0000644", 3, TypeFlag.regular, "");
+    @memcpy(tar_data[BLOCK_SIZE .. BLOCK_SIZE + 3], "SO!");
+    const link_path = "lib/alias.so";
+    const rec_len = writePaxRecord(&pax_buf, "linkpath", "lib/real.so");
+    var pos: usize = BLOCK_SIZE * 2;
+    writeHeader(tar_data[pos..][0..BLOCK_SIZE], "PaxHeader", "0000644", rec_len, TypeFlag.pax_extended, "");
+    @memcpy(tar_data[pos + BLOCK_SIZE ..][0..rec_len], pax_buf[0..rec_len]);
+    pos += BLOCK_SIZE + alignToBlock(rec_len);
+    writeHeader(tar_data[pos..][0..BLOCK_SIZE], link_path, "0000777", 0, TypeFlag.symlink, "wrong/target");
+
+    var tmp_buf: [128]u8 = undefined;
+    const tmp_dir = std.fmt.bufPrint(&tmp_buf, "/tmp/nb-test-paxlink-{d}", .{std.c.getpid()}) catch unreachable;
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.createDirAbsolute(lib_io, tmp_dir, .default_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(lib_io, tmp_dir) catch {};
+
+    const files = try extractToDir(alloc, lib_io, &tar_data, tmp_dir);
+    defer {
+        for (files) |f| alloc.free(f);
+        alloc.free(files);
+    }
+
+    var path_buf: [4096]u8 = undefined;
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ tmp_dir, link_path }) catch unreachable;
+    const n = try std.Io.Dir.readLinkAbsolute(lib_io, abs, &link_buf);
+    try testing.expectEqualStrings("lib/real.so", link_buf[0..n]);
 }

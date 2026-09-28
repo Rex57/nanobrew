@@ -4,6 +4,9 @@ All notable changes to nanobrew are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Honor pax extended `path`/`linkpath` headers in the native tar fallback so bottles with long paths + hardlinks (gcc 16.2.0) extract correctly. (#403)
+
 ## [0.1.212] - 2026-09-17
 
 ### Added

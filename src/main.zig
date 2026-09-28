@@ -1677,7 +1677,7 @@ fn fullInstallOne(
         if (!nb.store.hasEntry(g_io, f.bottle_sha256)) {
             nb.store.ensureEntry(alloc, g_io, blob_path, f.bottle_sha256) catch |err| {
                 stderr.print("nb: {s}: extract failed: {}\n", .{ f.name, err }) catch {};
-                fail_reason.* = "extract failed";
+                fail_reason.* = std.fmt.allocPrint(std.heap.smp_allocator, "extract failed: {s}", .{@errorName(err)}) catch "extract failed";
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
