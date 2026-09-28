@@ -7,6 +7,9 @@ All notable changes to nanobrew are documented here.
 ### Added
 - Opt-in Monterey Intel Git publish job: dispatch-gated syft/grype scan gate, immutable GHCR bottles with anonymous pull verification, a rewritten `registry-monterey.json`, and a prerelease. Companion Rosetta and Linux smoke jobs exercise the same stack under translation and from the default Linux catalog. (#388)
 
+### Fixed
+- Create the `/opt/nb` and `/opt/homebrew` symlinks during installation by running `nb init` from both installers, and print the absolute nb path in `sudo … init` hints so they work under sudo's secure_path. (#399)
+
 ## [0.1.212] - 2026-09-17
 
 ### Added
