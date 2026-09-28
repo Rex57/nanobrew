@@ -109,6 +109,47 @@ jobs:
         run: |
           echo 'Built for macOS 12, tested on Intel macOS 15. Monterey runtime validation remains required. Publication happens only when the publish dispatch input is set; the default registry is unchanged.' >> "$GITHUB_STEP_SUMMARY"
 
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      NANOBREW_NO_TELEMETRY: '1'
+      NANOBREW_DISABLE_UPSTREAM_REGISTRY_REMOTE: '1'
+      NANOBREW_DISABLE_UPSTREAM_FRESHNESS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # Native build on each arch (build.zig links libc on Linux); the
+      # `linux`/`linux-arm` steps are musl cross-compiles for releases.
+      - name: Build native nb client
+        run: zig build -Doptimize=ReleaseFast
+      - name: Install default-catalog Git stack and check the short-prefix link
+        env:
+          NANOBREW_UPSTREAM_REGISTRY_CACHE: ${{ github.workspace }}/registry/upstream.json
+        run: |
+          sudo ./zig-out/bin/nb init
+          sudo chown -R "$(id -un)" /opt/nanobrew
+          test "$(readlink /opt/nb)" = /opt/nanobrew/prefix
+          ./zig-out/bin/nb install expat readline pcre2 libssh2 openldap curl git
+          ./zig-out/bin/nb doctor
+      - name: Smoke installed Git stack
+        run: python3 scripts/bottles/linux_git_smoke.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-git-smoke-${{ matrix.runner }}
+          path: dist/linux-git-smoke-*.json
+          if-no-files-found: warn
+      - name: Report scope
+        run: |
+          echo "Linux ${{ matrix.runner }}: default-catalog git stack installed and smoked (Homebrew Linux bottles), not Monterey bottles." >> "$GITHUB_STEP_SUMMARY"
+
   rosetta:
     needs: intel
     runs-on: macos-15

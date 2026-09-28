@@ -63,6 +63,12 @@ an Apple Silicon macOS 15 runner via `arch -x86_64`. Its `installed-tests.json`
 carries `host_arch` and `rosetta_translated` markers; it exercises the client
 and payloads under translation but is not a Monterey runtime test.
 
+A Linux coverage job installs the same stack from the default catalog on
+x86_64 and aarch64 Ubuntu runners and runs `linux_git_smoke.py` against it.
+It validates the default-catalog Linux pins of the same packages (and the
+`/opt/nb` short-prefix link) so a later promotion keeps versions matched
+across platforms; it exercises Homebrew Linux bottles, not Monterey bottles.
+
 Before promotion: test on actual Monterey, assess omitted features, scan the
 binaries, publish immutable blobs, and update the registry only with evidence.
 
