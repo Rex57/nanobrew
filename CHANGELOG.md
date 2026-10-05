@@ -4,10 +4,13 @@ All notable changes to nanobrew are documented here.
 
 ## [Unreleased]
 
+## [0.1.213] - 2026-10-05
+
 ### Added
 - Opt-in Monterey Intel Git publish job: dispatch-gated syft/grype scan gate, immutable GHCR bottles with anonymous pull verification, a rewritten `registry-monterey.json`, and a prerelease. Companion Rosetta and Linux smoke jobs exercise the same stack under translation and from the default Linux catalog. (#388)
 
 ### Fixed
+- `nb upgrade` no longer deletes the new keg's `opt/<name>` link when it unlinks the old version, which left dependents failing with dyld `Library not loaded`. `nb doctor` now repairs missing or stale `opt/` links on installed kegs. Reported and root-caused by @Rex57. (#407)
 - Honor pax extended `path`/`linkpath` headers in the native tar fallback so bottles with long paths + hardlinks (gcc 16.2.0) extract correctly. (#403)
 - Create the `/opt/nb` and `/opt/homebrew` symlinks during installation by running `nb init` from both installers, and print the absolute nb path in `sudo … init` hints so they work under sudo's secure_path. (#399)
 - `nb doctor` now checks (and creates when possible) the `/opt/nb` short-prefix symlink; `nb install` warns before downloading when it is unavailable. (#399)

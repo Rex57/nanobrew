@@ -6,7 +6,7 @@
 
 const std = @import("std");
 
-const VERSION = "0.1.212";
+const VERSION = "0.1.213";
 
 var g_io: std.Io = undefined;
 
