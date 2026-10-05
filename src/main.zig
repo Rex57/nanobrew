@@ -4749,6 +4749,22 @@ fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
             }
         }
 
+        // 4b. Kegs whose prefix/opt/<name> link is missing or stale. Bottles
+        // load dependencies through opt/<dep>, so a lost link breaks every
+        // dependent at load time; older `nb upgrade` runs deleted it (#407).
+        for (kegs) |keg| {
+            var keg_path_buf: [512]u8 = undefined;
+            const keg_path = std.fmt.bufPrint(&keg_path_buf, "{s}/Cellar/{s}/{s}", .{ PREFIX, keg.name, keg.version }) catch continue;
+            std.Io.Dir.accessAbsolute(g_io, keg_path, .{}) catch continue;
+            if (nb.linker.optLinkIsCurrent(keg.name, keg.version)) continue;
+            if (nb.linker.repairOptLink(keg.name, keg.version)) {
+                stdout.print("  ✓ Repaired {s}/opt/{s} -> Cellar/{s}/{s}\n", .{ PREFIX, keg.name, keg.name, keg.version }) catch {};
+            } else |_| {
+                stdout.print("  ✗ {s}/opt/{s} missing or stale (fix: nb link {s})\n", .{ PREFIX, keg.name, keg.name }) catch {};
+                issues += 1;
+            }
+        }
+
         if (std.Io.Dir.openDirAbsolute(g_io, ROOT ++ "/store", .{ .iterate = true })) |d| {
             var dir = d;
             defer dir.close(g_io);

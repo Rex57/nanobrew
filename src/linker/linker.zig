@@ -1199,6 +1199,28 @@ pub fn needsLinkRepair(name: []const u8, version: []const u8, options: LinkOptio
     return false;
 }
 
+/// Return true when prefix/opt/<name> points at Cellar/<name>/<version>.
+pub fn optLinkIsCurrent(name: []const u8, version: []const u8) bool {
+    var keg_buf: [512]u8 = undefined;
+    const keg_dir = std.fmt.bufPrint(&keg_buf, "{s}/{s}/{s}", .{ CELLAR_DIR, name, version }) catch return false;
+    var opt_buf: [512]u8 = undefined;
+    const opt_link = std.fmt.bufPrint(&opt_buf, "{s}/{s}", .{ OPT_DIR, name }) catch return false;
+    return symlinkTargetEquals(opt_link, keg_dir);
+}
+
+/// Point prefix/opt/<name> at Cellar/<name>/<version>, replacing a missing or
+/// stale link without touching the keg's other links.
+pub fn repairOptLink(name: []const u8, version: []const u8) !void {
+    const lib_io = paths.safe_io;
+    var keg_buf: [512]u8 = undefined;
+    const keg_dir = std.fmt.bufPrint(&keg_buf, "{s}/{s}/{s}", .{ CELLAR_DIR, name, version }) catch return error.PathTooLong;
+    std.Io.Dir.createDirAbsolute(lib_io, OPT_DIR, .default_dir) catch {};
+    var opt_buf: [512]u8 = undefined;
+    const opt_link = std.fmt.bufPrint(&opt_buf, "{s}/{s}", .{ OPT_DIR, name }) catch return error.PathTooLong;
+    std.Io.Dir.deleteFileAbsolute(lib_io, opt_link) catch {};
+    try std.Io.Dir.symLinkAbsolute(lib_io, keg_dir, opt_link, .{});
+}
+
 /// Unlink a keg's files and remove opt/ symlink.
 pub fn unlinkKeg(name: []const u8, version: []const u8) !void {
     var keg_buf: [512]u8 = undefined;
@@ -1222,11 +1244,18 @@ pub fn unlinkKeg(name: []const u8, version: []const u8) !void {
     unlinkShimLinks(keg_dir);
     removeManagedWrapper(name, keg_dir);
 
-    // Remove opt/ symlink
-    const lib_io = paths.safe_io;
     var opt_buf: [512]u8 = undefined;
     const opt_link = std.fmt.bufPrint(&opt_buf, "{s}/{s}", .{ OPT_DIR, name }) catch return;
-    std.Io.Dir.deleteFileAbsolute(lib_io, opt_link) catch {};
+    removeOptLinkIfOwned(opt_link, keg_dir);
+}
+
+/// Remove prefix/opt/<name> only while it still points at `keg_dir`, the same
+/// ownership rule the file-link unlink paths use. `nb upgrade` links the new
+/// keg before unlinking the old one, so an unconditional delete wiped the new
+/// version's opt/ link and broke every dependent at load time (#407).
+fn removeOptLinkIfOwned(opt_link: []const u8, keg_dir: []const u8) void {
+    if (!symlinkTargetEquals(opt_link, keg_dir)) return;
+    std.Io.Dir.deleteFileAbsolute(paths.safe_io, opt_link) catch {};
 }
 
 test "needsManagedWrapper only wraps fortune binary" {
@@ -1451,6 +1480,35 @@ test "bottle payload: fast-path unlink removes keg symlinks, keeps non-keg (#347
     // ... non-keg symlink preserved.
     const n_cert = try std.Io.Dir.readLinkAbsolute(lib_io, f.dest_cert, &tbuf);
     try std.testing.expectEqualStrings(f.elsewhere, tbuf[0..n_cert]);
+}
+
+test "removeOptLinkIfOwned keeps opt/ link owned by another version (#407)" {
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, "/tmp/nb-test-optlink-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(lib_io, root) catch {};
+    const old_keg = try std.fmt.allocPrint(a, "{s}/Cellar/openssl@3/3.6.4", .{root});
+    const new_keg = try std.fmt.allocPrint(a, "{s}/Cellar/openssl@3/3.6.5", .{root});
+    const opt_dir = try std.fmt.allocPrint(a, "{s}/opt", .{root});
+    const opt_link = try std.fmt.allocPrint(a, "{s}/openssl@3", .{opt_dir});
+    testMkPath(lib_io, old_keg);
+    testMkPath(lib_io, new_keg);
+    testMkPath(lib_io, opt_dir);
+
+    // `nb upgrade` links the new keg, then unlinks the old one.
+    try std.Io.Dir.symLinkAbsolute(lib_io, new_keg, opt_link, .{});
+    removeOptLinkIfOwned(opt_link, old_keg);
+
+    var tbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try std.Io.Dir.readLinkAbsolute(lib_io, opt_link, &tbuf);
+    try std.testing.expectEqualStrings(new_keg, tbuf[0..n]);
+
+    removeOptLinkIfOwned(opt_link, new_keg);
+    if (std.Io.Dir.readLinkAbsolute(lib_io, opt_link, &tbuf)) |_| {
+        return error.TestUnexpectedOptLinkSurvived;
+    } else |_| {}
 }
 
 test "bottle payload: slow-path unlink removes keg symlinks, keeps non-keg (#347)" {
